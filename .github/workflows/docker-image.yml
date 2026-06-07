@@ -18,7 +18,7 @@ env:
 
 jobs:
   build:
-    name: Build and push backend image
+    name: Build and push program image
     runs-on: ubuntu-latest
 
     steps:
@@ -51,8 +51,8 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
-          context: ./backend
-          file: ./backend/Dockerfile
+          context: ./program
+          file: ./program/Dockerfile
           platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'pull_request' }}
           tags: |
