@@ -1,4 +1,4 @@
-name: Docker Image
+name: Docker Publish
 
 on:
   push:
@@ -30,7 +30,10 @@ jobs:
 
       - name: Set image tags
         id: image
-        run: echo "date_tag=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+        run: |
+          commit_date="$(git show -s --format=%cI "$GITHUB_SHA")"
+          date_tag="$(date -u -d "$commit_date" +%Y%m%d)"
+          echo "date_tag=$date_tag" >> "$GITHUB_OUTPUT"
 
       - name: Validate Docker Hub secrets
         if: github.event_name != 'pull_request'
