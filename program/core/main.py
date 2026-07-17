@@ -101,12 +101,23 @@ async def remove_session(session_id: str, user: AuthUser = Depends(require_user)
     return {"status": "ok"}
 
 
+@app.delete("/api/sessions/{session_id}/messages/{message_id}")
+async def truncate_messages(
+    session_id: str,
+    message_id: int,
+    user: AuthUser = Depends(require_user),
+) -> dict[str, str]:
+    if not storage.delete_message_and_after(user.user_id, session_id, message_id):
+        raise HTTPException(status_code=404, detail="Message not found")
+    return {"status": "ok"}
+
+
 @app.post("/api/chat/stream")
 async def chat_stream(chat: ChatStreamRequest, user: AuthUser = Depends(require_user)) -> StreamingResponse:
     providers = providers_for_model(chat.model, chat.provider)
-    messages = build_history(chat, user)
+    messages, is_first_exchange = build_history(chat, user)
     return StreamingResponse(
-        persistent_stream(chat, user, providers, messages),
+        persistent_stream(chat, user, providers, messages, generate_title=is_first_exchange),
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

@@ -131,6 +131,29 @@ button {
   display: none;
 }
 
+.sidebar-search {
+  padding: 0 12px 8px;
+}
+
+.sidebar-search input {
+  width: 100%;
+  height: 36px;
+  padding: 0 12px;
+  background: var(--sidebar-hover);
+  border: 1px solid transparent;
+  border-radius: 10px;
+  outline: none;
+  font-size: 14px;
+}
+
+.sidebar-search input:focus {
+  border-color: var(--sidebar-muted);
+}
+
+.sidebar-search input::placeholder {
+  color: var(--sidebar-muted);
+}
+
 .session-list {
   flex: 1;
   overflow-y: auto;
@@ -524,6 +547,28 @@ button {
   border-left: 3px solid var(--border);
 }
 
+.message-body table {
+  display: block;
+  width: max-content;
+  max-width: 100%;
+  margin: 0.8em 0;
+  overflow-x: auto;
+  border-collapse: collapse;
+  font-size: 0.95em;
+}
+
+.message-body th,
+.message-body td {
+  padding: 6px 12px;
+  border: 1px solid var(--border);
+  text-align: left;
+}
+
+.message-body th {
+  background: var(--surface-2);
+  font-weight: 600;
+}
+
 .message-body hr {
   margin: 1em 0;
   border: 0;
@@ -586,6 +631,51 @@ button {
   border-radius: 0;
   font-size: 13px;
   line-height: 1.6;
+}
+
+/* ---------- 消息编辑 ---------- */
+
+.edit-form {
+  width: 100%;
+  padding: 12px;
+  background: var(--user-bubble);
+  border-radius: 18px;
+}
+
+.edit-form textarea {
+  width: 100%;
+  padding: 0;
+  resize: vertical;
+  border: 0;
+  outline: none;
+  background: transparent;
+  line-height: 1.6;
+  font-size: 15px;
+}
+
+.edit-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.edit-actions button {
+  height: 34px;
+  padding: 0 16px;
+  border-radius: 17px;
+  font-size: 14px;
+  font-weight: 500;
+}
+
+.edit-cancel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+}
+
+.edit-save {
+  color: var(--accent-text);
+  background: var(--accent);
 }
 
 /* ---------- 输入区 ---------- */

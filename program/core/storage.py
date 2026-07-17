@@ -172,6 +172,31 @@ def list_messages(user_id: str, session_id: str, limit: int | None = None) -> li
     return [row_to_message(row) for row in reversed(rows)]
 
 
+def delete_message_and_after(user_id: str, session_id: str, message_id: int) -> bool:
+    """删除指定消息及其之后的所有消息，用于编辑重发/重新生成。"""
+    with connect() as connection:
+        row = connection.execute(
+            """
+            SELECT messages.id
+            FROM messages
+            INNER JOIN sessions ON sessions.id = messages.session_id
+            WHERE messages.id = ? AND sessions.id = ? AND sessions.user_id = ?
+            """,
+            (message_id, session_id, user_id),
+        ).fetchone()
+        if not row:
+            return False
+        connection.execute(
+            "DELETE FROM messages WHERE session_id = ? AND id >= ?",
+            (session_id, message_id),
+        )
+        connection.execute(
+            "UPDATE sessions SET updated_at = ? WHERE id = ?",
+            (now_ms(), session_id),
+        )
+    return True
+
+
 def add_message(
     user_id: str,
     session_id: str,

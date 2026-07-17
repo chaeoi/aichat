@@ -23,6 +23,8 @@
     abortController: null,
     modelMenuOpen: false,
     menuSessionId: "",
+    editingIndex: -1,
+    sessionFilter: "",
   };
 
   const el = {};
@@ -32,6 +34,7 @@
     "sidebarCloseButton",
     "sessionList",
     "sessionMenu",
+    "sessionSearchInput",
     "newChatButton",
     "topbarNewChatButton",
     "menuButton",
@@ -305,6 +308,33 @@
         continue;
       }
 
+      const tableSeparator = /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/;
+      if (
+        line.includes("|") &&
+        i + 1 < lines.length &&
+        lines[i + 1].includes("|") &&
+        tableSeparator.test(lines[i + 1])
+      ) {
+        flushAll();
+        const splitCells = (row) =>
+          row.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((cell) => renderInline(cell.trim()));
+        const headers = splitCells(line);
+        i += 2;
+        const rows = [];
+        while (i < lines.length && lines[i].trim() && lines[i].includes("|")) {
+          rows.push(splitCells(lines[i]));
+          i++;
+        }
+        i--; // for 循环还会自增一次
+        out.push(
+          `<table><thead><tr>${headers.map((cell) => `<th>${cell}</th>`).join("")}</tr></thead>` +
+            `<tbody>${rows
+              .map((row) => `<tr>${row.map((cell) => `<td>${cell}</td>`).join("")}</tr>`)
+              .join("")}</tbody></table>`,
+        );
+        continue;
+      }
+
       const unordered = line.match(/^\s*[-*+]\s+(.*)$/);
       const ordered = line.match(/^\s*\d+[.)]\s+(.*)$/);
       if (unordered || ordered) {
@@ -353,16 +383,21 @@
   function renderSessions() {
     el.sessionList.innerHTML = "";
 
-    if (!state.sessions.length) {
+    const filter = state.sessionFilter.trim().toLowerCase();
+    const visible = filter
+      ? state.sessions.filter((session) => (session.title || "").toLowerCase().includes(filter))
+      : state.sessions;
+
+    if (!visible.length) {
       const empty = document.createElement("div");
       empty.className = "session-empty";
-      empty.textContent = "还没有历史对话";
+      empty.textContent = filter ? "没有匹配的对话" : "还没有历史对话";
       el.sessionList.append(empty);
       return;
     }
 
     let lastGroup = "";
-    for (const session of state.sessions) {
+    for (const session of visible) {
       const group = sessionGroupLabel(session.updatedAt || 0);
       if (group !== lastGroup) {
         const label = document.createElement("div");
@@ -464,16 +499,38 @@
       return;
     }
 
-    for (const message of state.messages) {
-      el.chatThread.append(createMessageNode(message));
-    }
+    state.messages.forEach((message, index) => {
+      el.chatThread.append(createMessageNode(message, index));
+    });
     scrollToBottom(true);
   }
 
-  function createMessageNode(message) {
+  const ICONS = {
+    copy: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>',
+    edit: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>',
+    regenerate: '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg>',
+  };
+
+  function actionButton(action, title) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.dataset.action = action;
+    button.title = title;
+    button.setAttribute("aria-label", title);
+    button.innerHTML = ICONS[action];
+    return button;
+  }
+
+  function createMessageNode(message, index) {
     const wrap = document.createElement("div");
     wrap.className = `message ${message.role}`;
+    wrap.dataset.index = String(index);
     if (message.streaming) wrap.classList.add("streaming");
+
+    if (message.role === "user" && state.editingIndex === index) {
+      wrap.append(createEditForm(message));
+      return wrap;
+    }
 
     const body = document.createElement("div");
     body.className = "message-body";
@@ -491,21 +548,46 @@
       wrap.append(error);
     }
 
-    if (message.role === "assistant" && !message.streaming && message.content) {
+    if (!message.streaming && !state.isStreaming) {
       const actions = document.createElement("div");
       actions.className = "message-actions";
-      const copy = document.createElement("button");
-      copy.type = "button";
-      copy.dataset.action = "copy";
-      copy.title = "复制";
-      copy.setAttribute("aria-label", "复制");
-      copy.innerHTML =
-        '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>';
-      actions.append(copy);
-      wrap.append(actions);
+      if (message.role === "assistant" && message.content) {
+        actions.append(actionButton("copy", "复制"));
+        if (message.id) actions.append(actionButton("regenerate", "重新生成"));
+      }
+      if (message.role === "user" && message.id) {
+        actions.append(actionButton("edit", "编辑"));
+      }
+      if (actions.children.length) wrap.append(actions);
     }
 
     return wrap;
+  }
+
+  function createEditForm(message) {
+    const form = document.createElement("div");
+    form.className = "edit-form";
+
+    const textarea = document.createElement("textarea");
+    textarea.value = message.content;
+    textarea.rows = Math.min(8, Math.max(2, message.content.split("\n").length));
+
+    const actions = document.createElement("div");
+    actions.className = "edit-actions";
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "edit-cancel";
+    cancel.dataset.action = "edit-cancel";
+    cancel.textContent = "取消";
+    const save = document.createElement("button");
+    save.type = "button";
+    save.className = "edit-save";
+    save.dataset.action = "edit-save";
+    save.textContent = "发送";
+    actions.append(cancel, save);
+
+    form.append(textarea, actions);
+    return form;
   }
 
   function isNearBottom() {
@@ -527,8 +609,10 @@
     requestAnimationFrame(() => {
       streamRenderQueued = false;
       const last = state.messages[state.messages.length - 1];
+      // 切换会话后旧流的渲染回调可能还在队列里，只在仍是流式消息时更新
+      if (!last || !last.streaming) return;
       const node = el.chatThread.lastElementChild?.querySelector(".message-body");
-      if (!last || !node) return;
+      if (!node) return;
       const stick = isNearBottom();
       node.innerHTML = renderMarkdown(last.content);
       scrollToBottom(stick);
@@ -560,6 +644,7 @@
     if (state.isStreaming) stopStreaming();
     state.activeSessionId = "";
     state.messages = [];
+    state.editingIndex = -1;
     closeSidebar();
     renderSessions();
     renderMessages();
@@ -569,6 +654,7 @@
   async function openSession(sessionId) {
     if (state.isStreaming) stopStreaming();
     state.activeSessionId = sessionId;
+    state.editingIndex = -1;
     state.messages = state.messageCache.get(sessionId) || [];
     closeSidebar();
     renderSessions();
@@ -586,7 +672,12 @@
   async function sendMessage() {
     const text = el.promptInput.value.trim();
     if (!text || state.isStreaming || !state.authToken) return;
+    el.promptInput.value = "";
+    resizeTextarea();
+    await dispatchPrompt(text);
+  }
 
+  async function dispatchPrompt(text) {
     let sessionId = state.activeSessionId;
     if (!sessionId) {
       sessionId = createSessionId();
@@ -599,14 +690,19 @@
       });
     }
 
-    el.promptInput.value = "";
-    resizeTextarea();
-
     const userMessage = { role: "user", content: text };
     const assistantMessage = { role: "assistant", content: "", streaming: true };
     state.messages = [...state.messages, userMessage, assistantMessage];
     state.messageCache.set(sessionId, state.messages);
 
+    await streamChat(
+      sessionId,
+      { session_id: sessionId, content: text, model: state.activeModel },
+      assistantMessage,
+    );
+  }
+
+  async function streamChat(sessionId, requestBody, assistantMessage) {
     state.isStreaming = true;
     state.abortController = new AbortController();
     renderSessions();
@@ -616,14 +712,10 @@
     try {
       const response = await api("/api/chat/stream", {
         method: "POST",
-        body: JSON.stringify({
-          session_id: sessionId,
-          content: text,
-          model: state.activeModel,
-        }),
+        body: JSON.stringify(requestBody),
         signal: state.abortController.signal,
       });
-      await consumeStream(response, assistantMessage);
+      await consumeStream(response, assistantMessage, sessionId);
     } catch (error) {
       if (error.name === "AbortError") {
         assistantMessage.error = assistantMessage.content ? "" : "已停止生成";
@@ -634,13 +726,29 @@
       assistantMessage.streaming = false;
       state.isStreaming = false;
       state.abortController = null;
-      renderMessages();
+      await refreshAfterStream(sessionId, assistantMessage);
       renderComposer();
       syncSessions();
     }
   }
 
-  async function consumeStream(response, assistantMessage) {
+  async function refreshAfterStream(sessionId, assistantMessage) {
+    // 成功后用服务端消息替换本地临时消息，拿到消息 id 供编辑/重新生成使用。
+    // 出错时保留本地内容（服务端可能没有对应记录），错误提示不丢。
+    if (!assistantMessage.error) {
+      try {
+        await fetchMessages(sessionId);
+        if (state.activeSessionId === sessionId) {
+          state.messages = state.messageCache.get(sessionId);
+        }
+      } catch {
+        /* 拉取失败就继续用本地副本 */
+      }
+    }
+    if (state.activeSessionId === sessionId) renderMessages();
+  }
+
+  async function consumeStream(response, assistantMessage, sessionId) {
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
@@ -651,11 +759,15 @@
       buffer = isFinal ? "" : events.pop() || "";
 
       for (const eventText of events) {
+        let eventName = "message";
         for (const line of eventText.split("\n")) {
-          if (!line.startsWith("data:")) continue;
-          const data = line.slice(5).trim();
-          if (!data || data === "[DONE]") continue;
-          applyStreamData(data, assistantMessage);
+          if (line.startsWith("event:")) {
+            eventName = line.slice(6).trim();
+          } else if (line.startsWith("data:")) {
+            const data = line.slice(5).trim();
+            if (!data || data === "[DONE]") continue;
+            applyStreamData(eventName, data, assistantMessage, sessionId);
+          }
         }
       }
     };
@@ -669,11 +781,19 @@
     consume(decoder.decode() + "\n\n", true);
   }
 
-  function applyStreamData(data, assistantMessage) {
+  function applyStreamData(eventName, data, assistantMessage, sessionId) {
     let parsed;
     try {
       parsed = JSON.parse(data);
     } catch {
+      return;
+    }
+    if (eventName === "title" && parsed.title) {
+      const session = state.sessions.find((item) => item.id === sessionId);
+      if (session) {
+        session.title = parsed.title;
+        renderSessions();
+      }
       return;
     }
     if (parsed.error) {
@@ -682,6 +802,71 @@
     }
     const choice = (parsed.choices || [])[0] || {};
     assistantMessage.content += choice.delta?.content || choice.message?.content || "";
+  }
+
+  async function regenerateMessage(index) {
+    const message = state.messages[index];
+    const sessionId = state.activeSessionId;
+    if (!message?.id || !sessionId || state.isStreaming) return;
+
+    try {
+      await api(
+        `/api/sessions/${encodeURIComponent(sessionId)}/messages/${message.id}`,
+        { method: "DELETE" },
+      );
+    } catch (error) {
+      showToast(error.message || "操作失败");
+      return;
+    }
+
+    const assistantMessage = { role: "assistant", content: "", streaming: true };
+    state.messages = [...state.messages.slice(0, index), assistantMessage];
+    state.messageCache.set(sessionId, state.messages);
+
+    await streamChat(
+      sessionId,
+      { session_id: sessionId, model: state.activeModel, regenerate: true },
+      assistantMessage,
+    );
+  }
+
+  function startEdit(index) {
+    if (state.isStreaming) return;
+    state.editingIndex = index;
+    renderMessages();
+    const textarea = el.chatThread.querySelector(".edit-form textarea");
+    if (textarea) {
+      textarea.focus();
+      textarea.setSelectionRange(textarea.value.length, textarea.value.length);
+    }
+  }
+
+  function cancelEdit() {
+    if (state.editingIndex === -1) return;
+    state.editingIndex = -1;
+    renderMessages();
+  }
+
+  async function submitEdit(index, text) {
+    const message = state.messages[index];
+    const sessionId = state.activeSessionId;
+    const trimmed = text.trim();
+    if (!trimmed || !message?.id || !sessionId || state.isStreaming) return;
+
+    try {
+      await api(
+        `/api/sessions/${encodeURIComponent(sessionId)}/messages/${message.id}`,
+        { method: "DELETE" },
+      );
+    } catch (error) {
+      showToast(error.message || "操作失败");
+      return;
+    }
+
+    state.editingIndex = -1;
+    state.messages = state.messages.slice(0, index);
+    state.messageCache.set(sessionId, state.messages);
+    await dispatchPrompt(trimmed);
   }
 
   function stopStreaming() {
@@ -887,17 +1072,37 @@
         await copyText(code, copyCode);
         return;
       }
-      const copyMessage = event.target.closest('[data-action="copy"]');
-      if (copyMessage) {
-        const index = [...el.chatThread.querySelectorAll(".message")].indexOf(
-          copyMessage.closest(".message"),
-        );
-        const message = state.messages[index];
-        if (message) {
+
+      const actionButton = event.target.closest("[data-action]");
+      const messageNode = actionButton?.closest(".message");
+      if (!actionButton || !messageNode) return;
+      const index = Number(messageNode.dataset.index);
+      const message = state.messages[index];
+      if (!message) return;
+
+      switch (actionButton.dataset.action) {
+        case "copy":
           await copyText(message.content);
           showToast("已复制");
-        }
+          break;
+        case "edit":
+          startEdit(index);
+          break;
+        case "edit-cancel":
+          cancelEdit();
+          break;
+        case "edit-save":
+          await submitEdit(index, messageNode.querySelector("textarea")?.value || "");
+          break;
+        case "regenerate":
+          await regenerateMessage(index);
+          break;
       }
+    });
+
+    el.sessionSearchInput.addEventListener("input", () => {
+      state.sessionFilter = el.sessionSearchInput.value;
+      renderSessions();
     });
 
     document.addEventListener("click", (event) => {
@@ -925,16 +1130,43 @@
   }
 
   async function copyText(text, button) {
+    let copied = false;
     try {
-      await navigator.clipboard.writeText(text);
-      if (button) {
-        const original = button.textContent;
-        button.textContent = "已复制";
-        setTimeout(() => (button.textContent = original), 1500);
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+        copied = true;
       }
     } catch {
-      showToast("复制失败");
+      /* 走降级方案 */
     }
+    if (!copied) copied = fallbackCopy(text);
+    if (!copied) {
+      showToast("复制失败");
+      return;
+    }
+    if (button) {
+      const original = button.textContent;
+      button.textContent = "已复制";
+      setTimeout(() => (button.textContent = original), 1500);
+    }
+  }
+
+  // http 页面（非安全上下文）没有 navigator.clipboard，用隐藏 textarea 兜底
+  function fallbackCopy(text) {
+    const textarea = document.createElement("textarea");
+    textarea.value = text;
+    textarea.style.position = "fixed";
+    textarea.style.opacity = "0";
+    document.body.append(textarea);
+    textarea.select();
+    let copied = false;
+    try {
+      copied = document.execCommand("copy");
+    } catch {
+      copied = false;
+    }
+    textarea.remove();
+    return copied;
   }
 
   /* ========== 启动 ========== */

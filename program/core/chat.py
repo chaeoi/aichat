@@ -43,18 +43,27 @@ def session_title_for(content: str) -> str:
     return title or DEFAULT_TITLE
 
 
-def build_history(chat: ChatStreamRequest, user: AuthUser) -> list[dict[str, str]]:
-    """Persist the incoming user message, then return the model context from the DB."""
-    try:
-        storage.ensure_session(user.user_id, chat.session_id, session_title_for(chat.content))
-    except PermissionError as exc:
-        raise HTTPException(status_code=409, detail="Session id already in use") from exc
-
-    storage.add_message(user.user_id, chat.session_id, "user", chat.content)
+def build_history(chat: ChatStreamRequest, user: AuthUser) -> tuple[list[dict[str, str]], bool]:
+    """Persist the incoming user message (unless regenerating), then return
+    (model context from the DB, whether this is the session's first exchange)."""
+    if chat.regenerate:
+        if not storage.get_session(user.user_id, chat.session_id):
+            raise HTTPException(status_code=404, detail="Session not found")
+    else:
+        try:
+            storage.ensure_session(user.user_id, chat.session_id, session_title_for(chat.content))
+        except PermissionError as exc:
+            raise HTTPException(status_code=409, detail="Session id already in use") from exc
+        storage.add_message(user.user_id, chat.session_id, "user", chat.content)
 
     limit = load_config().server.max_history_messages
     history = storage.list_messages(user.user_id, chat.session_id, limit=limit)
-    return [{"role": message["role"], "content": message["content"]} for message in history]
+    if not history:
+        raise HTTPException(status_code=400, detail="Session has no messages")
+
+    user_turns = sum(1 for message in history if message["role"] == "user")
+    is_first_exchange = user_turns == 1 and history[-1]["role"] == "user"
+    return [{"role": message["role"], "content": message["content"]} for message in history], is_first_exchange
 
 
 def build_payload(chat: ChatStreamRequest, messages: list[dict[str, str]]) -> dict[str, Any]:
@@ -126,11 +135,19 @@ async def persistent_stream(
     user: AuthUser,
     providers: list[ProviderConfig],
     messages: list[dict[str, str]],
+    generate_title: bool = False,
 ) -> AsyncIterator[bytes]:
     """Relay the upstream SSE stream while mirroring the assistant text into the DB."""
     payload = build_payload(chat, messages)
     assistant_content = ""
     buffer = ""
+    persisted = False
+
+    def persist() -> None:
+        nonlocal persisted
+        if not persisted and assistant_content:
+            persisted = True
+            storage.add_message(user.user_id, chat.session_id, "assistant", assistant_content, model=chat.model)
 
     try:
         async for chunk in stream_with_fallback(payload, providers):
@@ -138,13 +155,65 @@ async def persistent_stream(
             delta, buffer = extract_content_from_sse_buffer(buffer)
             assistant_content += delta
             yield chunk
+
+        delta, _ = extract_content_from_sse_buffer(buffer + "\n\n")
+        buffer = ""
+        assistant_content += delta
+        persist()
+
+        if generate_title and assistant_content:
+            title = await generate_session_title(chat, user, providers, messages[-1]["content"], assistant_content)
+            if title:
+                yield sse_event("title", {"title": title})
     finally:
         # Persist whatever was generated, including partial output after a
         # client disconnect or mid-stream failure.
         delta, _ = extract_content_from_sse_buffer(buffer + "\n\n")
         assistant_content += delta
-        if assistant_content:
-            storage.add_message(user.user_id, chat.session_id, "assistant", assistant_content, model=chat.model)
+        persist()
+
+
+async def generate_session_title(
+    chat: ChatStreamRequest,
+    user: AuthUser,
+    providers: list[ProviderConfig],
+    question: str,
+    answer: str,
+) -> str | None:
+    """Summarize the first exchange into a short session title. Failures are silent."""
+    prompt = (
+        "用不超过 10 个字概括下面这段对话的主题，直接输出标题本身，"
+        "不要引号、句号或任何解释。\n\n"
+        f"用户：{question[:500]}\n助手：{answer[:500]}"
+    )
+    payload = {
+        "model": chat.model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+        "max_tokens": 500,
+    }
+
+    for provider in providers:
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                response = await client.post(
+                    chat_url(provider),
+                    headers={
+                        "Authorization": f"Bearer {provider.api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                )
+            if response.status_code >= 400:
+                continue
+            content = (response.json()["choices"][0]["message"].get("content") or "").strip()
+            title = content.strip("\"'“”‘’《》").splitlines()[0].strip()[:30] if content else ""
+            if title:
+                storage.update_session_title(user.user_id, chat.session_id, title)
+                return title
+        except Exception:
+            continue
+    return None
 
 
 def extract_content_from_sse_buffer(buffer: str) -> tuple[str, str]:
@@ -177,6 +246,10 @@ def extract_content_from_sse_data(data: str) -> str:
     return delta + message
 
 
+def sse_event(event: str, data: dict[str, Any]) -> bytes:
+    payload = json.dumps(data, ensure_ascii=False)
+    return f"event: {event}\ndata: {payload}\n\n".encode()
+
+
 def sse_error(message: str) -> bytes:
-    payload = json.dumps({"error": {"message": message}}, ensure_ascii=False)
-    return f"event: error\ndata: {payload}\n\n".encode()
+    return sse_event("error", {"error": {"message": message}})
