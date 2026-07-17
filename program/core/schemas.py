@@ -1,25 +1,17 @@
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
 
 
-class Message(BaseModel):
-    role: str
-    content: str
-
-    @field_validator("role")
-    @classmethod
-    def validate_role(cls, value: str) -> str:
-        if value not in {"system", "user", "assistant"}:
-            raise ValueError("role must be system, user, or assistant")
-        return value
-
-
-class ChatRequest(BaseModel):
+class ChatStreamRequest(BaseModel):
+    session_id: str = Field(min_length=1, max_length=64, pattern=r"^[a-zA-Z0-9_-]+$")
+    content: str = Field(min_length=1, max_length=100_000)
+    model: str = Field(min_length=1)
     provider: str | None = None
-    model: str
-    messages: list[Message]
-    session_id: str | None = None
     temperature: float | None = Field(default=None, ge=0, le=2)
-    max_tokens: int | None = Field(default=None, gt=0, le=32000)
+    max_tokens: int | None = Field(default=None, gt=0, le=128_000)
+
+
+class SessionUpdateRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=100)
 
 
 class LoginRequest(BaseModel):
@@ -36,8 +28,3 @@ class LoginResponse(BaseModel):
 class AuthUser(BaseModel):
     user_id: str
     auth_type: str
-
-
-class SessionCreateRequest(BaseModel):
-    id: str | None = None
-    title: str = "新对话"

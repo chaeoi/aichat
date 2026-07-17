@@ -8,17 +8,9 @@ from fastapi.responses import StreamingResponse
 
 from . import storage
 from .auth import create_jwt, require_user, validate_access_key
-from .chat import (
-    available_models,
-    create_session_id,
-    persist_completion,
-    persist_user_message,
-    persistent_stream,
-    providers_for_chat,
-    request_completion_with_fallback,
-)
+from .chat import available_models, build_history, persistent_stream, providers_for_model
 from .config import load_config
-from .schemas import AuthUser, ChatRequest, LoginRequest, LoginResponse, SessionCreateRequest
+from .schemas import AuthUser, ChatStreamRequest, LoginRequest, LoginResponse, SessionUpdateRequest
 
 
 @asynccontextmanager
@@ -83,16 +75,6 @@ async def sessions(user: AuthUser = Depends(require_user)) -> dict[str, Any]:
     return {"sessions": storage.list_sessions(user.user_id)}
 
 
-@app.post("/api/sessions")
-async def create_chat_session(
-    session_request: SessionCreateRequest,
-    user: AuthUser = Depends(require_user),
-) -> dict[str, Any]:
-    session_id = session_request.id or create_session_id(user.user_id)
-    session = storage.create_session(user.user_id, session_id, session_request.title.strip() or "新对话")
-    return {"session": session}
-
-
 @app.get("/api/sessions/{session_id}")
 async def session_detail(session_id: str, user: AuthUser = Depends(require_user)) -> dict[str, Any]:
     session = storage.get_session(user.user_id, session_id)
@@ -101,22 +83,30 @@ async def session_detail(session_id: str, user: AuthUser = Depends(require_user)
     return {"session": session, "messages": storage.list_messages(user.user_id, session_id)}
 
 
+@app.patch("/api/sessions/{session_id}")
+async def rename_session(
+    session_id: str,
+    update: SessionUpdateRequest,
+    user: AuthUser = Depends(require_user),
+) -> dict[str, Any]:
+    session = storage.update_session_title(user.user_id, session_id, update.title.strip())
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {"session": session}
+
+
 @app.delete("/api/sessions/{session_id}")
 async def remove_session(session_id: str, user: AuthUser = Depends(require_user)) -> dict[str, str]:
     storage.delete_session(user.user_id, session_id)
     return {"status": "ok"}
 
 
-@app.post("/api/chat/completions")
-async def chat_completion(chat: ChatRequest, user: AuthUser = Depends(require_user)) -> dict[str, Any]:
-    providers = providers_for_chat(chat)
-    data = await request_completion_with_fallback(chat, providers)
-    persist_completion(chat, user, data)
-    return data
-
-
 @app.post("/api/chat/stream")
-async def chat_stream(chat: ChatRequest, user: AuthUser = Depends(require_user)) -> StreamingResponse:
-    providers = providers_for_chat(chat)
-    persist_user_message(chat, user)
-    return StreamingResponse(persistent_stream(chat, user, providers), media_type="text/event-stream")
+async def chat_stream(chat: ChatStreamRequest, user: AuthUser = Depends(require_user)) -> StreamingResponse:
+    providers = providers_for_model(chat.model, chat.provider)
+    messages = build_history(chat, user)
+    return StreamingResponse(
+        persistent_stream(chat, user, providers, messages),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )

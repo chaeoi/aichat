@@ -1,7 +1,5 @@
 import json
 from collections.abc import AsyncIterator
-from datetime import datetime, timezone
-from hashlib import sha256
 from typing import Any
 
 import httpx
@@ -9,7 +7,9 @@ from fastapi import HTTPException
 
 from . import storage
 from .config import ProviderConfig, load_config
-from .schemas import AuthUser, ChatRequest
+from .schemas import AuthUser, ChatStreamRequest
+
+DEFAULT_TITLE = "新对话"
 
 
 def available_models() -> list[str]:
@@ -21,28 +21,47 @@ def available_models() -> list[str]:
     return models
 
 
-def providers_for_chat(chat: ChatRequest) -> list[ProviderConfig]:
+def providers_for_model(model: str, provider_id: str | None) -> list[ProviderConfig]:
     providers = load_config().providers
 
-    if chat.provider:
-        matches = [provider for provider in providers if provider.id == chat.provider]
+    if provider_id:
+        matches = [provider for provider in providers if provider.id == provider_id]
         if not matches:
             raise HTTPException(status_code=404, detail="Provider not found")
-        if chat.model not in matches[0].models:
+        if model not in matches[0].models:
             raise HTTPException(status_code=400, detail="Model is not allowed for provider")
         return matches
 
-    matches = [provider for provider in providers if chat.model in provider.models]
+    matches = [provider for provider in providers if model in provider.models]
     if not matches:
-        raise HTTPException(status_code=404, detail="Provider not found")
+        raise HTTPException(status_code=404, detail="No provider serves this model")
     return matches
 
 
-def build_payload(chat: ChatRequest, model: str, stream: bool) -> dict[str, Any]:
+def session_title_for(content: str) -> str:
+    title = content.strip().splitlines()[0][:30].strip()
+    return title or DEFAULT_TITLE
+
+
+def build_history(chat: ChatStreamRequest, user: AuthUser) -> list[dict[str, str]]:
+    """Persist the incoming user message, then return the model context from the DB."""
+    try:
+        storage.ensure_session(user.user_id, chat.session_id, session_title_for(chat.content))
+    except PermissionError as exc:
+        raise HTTPException(status_code=409, detail="Session id already in use") from exc
+
+    storage.add_message(user.user_id, chat.session_id, "user", chat.content)
+
+    limit = load_config().server.max_history_messages
+    history = storage.list_messages(user.user_id, chat.session_id, limit=limit)
+    return [{"role": message["role"], "content": message["content"]} for message in history]
+
+
+def build_payload(chat: ChatStreamRequest, messages: list[dict[str, str]]) -> dict[str, Any]:
     payload: dict[str, Any] = {
-        "model": model,
-        "messages": [message.model_dump() for message in chat.messages],
-        "stream": stream,
+        "model": chat.model,
+        "messages": messages,
+        "stream": True,
     }
     if chat.temperature is not None:
         payload["temperature"] = chat.temperature
@@ -56,51 +75,11 @@ def chat_url(provider: ProviderConfig) -> str:
 
 
 def provider_error(provider: ProviderConfig, exc: Exception) -> str:
-    if isinstance(exc, HTTPException):
-        detail = exc.detail
-    else:
-        detail = str(exc)
-    return f"{provider.name}: {detail}"
+    return f"{provider.name}: {exc}"
 
 
-async def request_completion(chat: ChatRequest, provider: ProviderConfig) -> dict[str, Any]:
-    payload = build_payload(chat, chat.model, stream=False)
-
-    async with httpx.AsyncClient(timeout=120) as client:
-        response = await client.post(
-            chat_url(provider),
-            headers={
-                "Authorization": f"Bearer {provider.api_key}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-        )
-
-    if response.status_code >= 400:
-        raise HTTPException(status_code=response.status_code, detail=response.text)
-
-    return response.json()
-
-
-async def request_completion_with_fallback(
-    chat: ChatRequest,
-    providers: list[ProviderConfig],
-) -> dict[str, Any]:
-    errors: list[str] = []
-
-    for provider in providers:
-        try:
-            return await request_completion(chat, provider)
-        except (HTTPException, httpx.HTTPError) as exc:
-            errors.append(provider_error(provider, exc))
-
-    raise HTTPException(status_code=502, detail=f"All providers failed: {'; '.join(errors)}")
-
-
-async def stream_provider(chat: ChatRequest, provider: ProviderConfig) -> AsyncIterator[bytes]:
-    payload = build_payload(chat, chat.model, stream=True)
-
-    async with httpx.AsyncClient(timeout=None) as client:
+async def stream_provider(payload: dict[str, Any], provider: ProviderConfig) -> AsyncIterator[bytes]:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(300, connect=15)) as client:
         async with client.stream(
             "POST",
             chat_url(provider),
@@ -112,15 +91,15 @@ async def stream_provider(chat: ChatRequest, provider: ProviderConfig) -> AsyncI
         ) as response:
             if response.status_code >= 400:
                 body = await response.aread()
-                message = body.decode(errors="replace").replace("\n", " ")
-                raise RuntimeError(message)
+                message = body.decode(errors="replace").replace("\n", " ")[:500]
+                raise RuntimeError(f"HTTP {response.status_code}: {message}")
 
             async for chunk in response.aiter_bytes():
                 yield chunk
 
 
 async def stream_with_fallback(
-    chat: ChatRequest,
+    payload: dict[str, Any],
     providers: list[ProviderConfig],
 ) -> AsyncIterator[bytes]:
     errors: list[str] = []
@@ -128,74 +107,48 @@ async def stream_with_fallback(
     for provider in providers:
         yielded = False
         try:
-            async for chunk in stream_provider(chat, provider):
+            async for chunk in stream_provider(payload, provider):
                 yielded = True
                 yield chunk
             return
-        except (RuntimeError, httpx.HTTPError) as exc:
+        except Exception as exc:
             if yielded:
-                message = f"{provider.name}: upstream stream interrupted: {exc}"
-                yield sse_error(message)
+                # The stream broke mid-response; a fallback would restart the answer.
+                yield sse_error(f"{provider.name}: 上游流中断: {exc}")
                 return
             errors.append(provider_error(provider, exc))
 
-    yield sse_error(f"All providers failed: {'; '.join(errors)}")
+    yield sse_error(f"所有 provider 均失败: {'; '.join(errors)}")
 
 
 async def persistent_stream(
-    chat: ChatRequest,
+    chat: ChatStreamRequest,
     user: AuthUser,
     providers: list[ProviderConfig],
+    messages: list[dict[str, str]],
 ) -> AsyncIterator[bytes]:
+    """Relay the upstream SSE stream while mirroring the assistant text into the DB."""
+    payload = build_payload(chat, messages)
     assistant_content = ""
     buffer = ""
 
-    async for chunk in stream_with_fallback(chat, providers):
-        text = chunk.decode(errors="ignore")
-        buffer += text
-        delta, buffer = extract_content_from_sse_buffer(buffer)
+    try:
+        async for chunk in stream_with_fallback(payload, providers):
+            buffer += chunk.decode(errors="ignore")
+            delta, buffer = extract_content_from_sse_buffer(buffer)
+            assistant_content += delta
+            yield chunk
+    finally:
+        # Persist whatever was generated, including partial output after a
+        # client disconnect or mid-stream failure.
+        delta, _ = extract_content_from_sse_buffer(buffer + "\n\n")
         assistant_content += delta
-        yield chunk
-
-    delta, _ = extract_content_from_sse_buffer(buffer + "\n\n")
-    assistant_content += delta
-
-    if chat.session_id and assistant_content:
-        storage.add_message(user.user_id, chat.session_id, "assistant", assistant_content)
-
-
-def persist_user_message(chat: ChatRequest, user: AuthUser) -> None:
-    if not chat.session_id or not chat.messages:
-        return
-
-    title = "新对话"
-    first_user_message = next((message.content for message in chat.messages if message.role == "user"), "")
-    if first_user_message:
-        title = first_user_message[:28]
-
-    session = storage.ensure_session(user.user_id, chat.session_id, title)
-    latest_user_message = next((message for message in reversed(chat.messages) if message.role == "user"), None)
-    if latest_user_message:
-        storage.add_message(user.user_id, chat.session_id, "user", latest_user_message.content)
-        if session["title"] == "新对话":
-            storage.update_session_title(user.user_id, chat.session_id, latest_user_message.content[:28])
-
-
-def persist_completion(chat: ChatRequest, user: AuthUser, data: dict[str, Any]) -> None:
-    if not chat.session_id:
-        return
-    persist_user_message(chat, user)
-    content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-    if content:
-        storage.add_message(user.user_id, chat.session_id, "assistant", content)
-
-
-def create_session_id(user_id: str) -> str:
-    return sha256(f"{user_id}:{datetime.now(timezone.utc)}".encode()).hexdigest()
+        if assistant_content:
+            storage.add_message(user.user_id, chat.session_id, "assistant", assistant_content, model=chat.model)
 
 
 def extract_content_from_sse_buffer(buffer: str) -> tuple[str, str]:
-    events = buffer.split("\n\n")
+    events = buffer.replace("\r\n", "\n").split("\n\n")
     remainder = events.pop() or ""
     content = ""
 
@@ -217,9 +170,10 @@ def extract_content_from_sse_data(data: str) -> str:
     except json.JSONDecodeError:
         return ""
 
-    choice = parsed.get("choices", [{}])[0]
-    delta = choice.get("delta", {}).get("content", "")
-    message = choice.get("message", {}).get("content", "")
+    choices = parsed.get("choices") or [{}]
+    choice = choices[0] if choices else {}
+    delta = (choice.get("delta") or {}).get("content") or ""
+    message = (choice.get("message") or {}).get("content") or ""
     return delta + message
 
 

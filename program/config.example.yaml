@@ -9,6 +9,9 @@ server:
   jwt_expires_minutes: 43200
   data_path: "data/chat.db"
 
+  # 每次请求带给模型的最大历史消息条数（服务端从数据库构建上下文）。
+  max_history_messages: 40
+
   # Comma-separated origins are also supported through CORS_ORIGINS env var.
   cors_origins:
     - "*"

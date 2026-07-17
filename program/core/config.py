@@ -13,6 +13,7 @@ class ServerConfig(BaseModel):
     jwt_secret: str | None = None
     jwt_expires_minutes: int = Field(default=60 * 24 * 30, gt=0)
     data_path: str = "data/chat.db"
+    max_history_messages: int = Field(default=40, gt=0, le=500)
 
     @field_validator("access_keys")
     @classmethod
