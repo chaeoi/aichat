@@ -1,3 +1,4 @@
+import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -21,7 +22,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 def create_app() -> FastAPI:
     config = load_config()
-    app = FastAPI(title="AI Chat API", lifespan=lifespan)
+    app = FastAPI(title="AI Chat API", version=os.getenv("APP_VERSION", "dev"), lifespan=lifespan)
 
     app.add_middleware(
         CORSMiddleware,
